@@ -7,10 +7,11 @@ Start:   python3 zero_config_server.py            (Port 8787, Daten in ./data)
          PORT=80 DATA=/var/zero python3 zero_config_server.py
 
 Endpunkte (JSON):
-  POST /api/configs              Body {name, author, data}       -> {id, code}
-  GET  /api/configs             (?q=suche&limit=100&sort=new|top) -> [{id, name, author, code, downloads, created}]
-  GET  /api/configs/<idOrCode>   voller Eintrag inkl. data; zaehlt einen Download
-  GET  /api/health               {ok:true}
+  POST   /api/configs            Body {name, author, data}        -> {id, code, token}
+  GET    /api/configs           (?q=suche&limit=100&sort=new|top) -> [{id, name, author, code, downloads, created}]
+  GET    /api/configs/<idOrCode> Eintrag inkl. data (ohne token); zaehlt einen Download
+  DELETE /api/configs/<id>      (?token=...)                       -> {ok:true}  (nur mit richtigem Token)
+  GET    /api/health             {ok:true}
 
 Sicherheit/Limits: max 256 KB pro Config, einfache Feldpruefung, Rate-Limit pro IP.
 """
@@ -148,7 +149,8 @@ class Handler(BaseHTTPRequestHandler):
                         json.dump(e, f)
                 except Exception:
                     pass
-            return self._send(200, e)
+            pub = {k: v for k, v in e.items() if k != "token"}  # Token nie ausliefern
+            return self._send(200, pub)
         return self._send(404, {"error": "unknown endpoint"})
 
     def do_POST(self):
@@ -179,6 +181,7 @@ class Handler(BaseHTTPRequestHandler):
             "name": name,
             "author": author,
             "code": _new_code(),
+            "token": uuid.uuid4().hex,
             "downloads": 0,
             "created": int(time.time()),
             "data": data,
@@ -186,7 +189,25 @@ class Handler(BaseHTTPRequestHandler):
         with _lock:
             with open(_path(entry["id"]), "w", encoding="utf-8") as f:
                 json.dump(entry, f)
-        return self._send(200, {"id": entry["id"], "code": entry["code"]})
+        return self._send(200, {"id": entry["id"], "code": entry["code"], "token": entry["token"]})
+
+    def do_DELETE(self):
+        u = urlparse(self.path)
+        m = re.match(r"^/api/configs/([\w-]{1,40})$", u.path)
+        if not m:
+            return self._send(404, {"error": "unknown endpoint"})
+        token = parse_qs(u.query).get("token", [""])[0]
+        with _lock:
+            e = _find(m.group(1))
+            if not e:
+                return self._send(404, {"error": "not found"})
+            if not token or token != e.get("token"):
+                return self._send(403, {"error": "wrong token"})
+            try:
+                os.remove(_path(e["id"]))
+            except Exception:
+                pass
+        return self._send(200, {"ok": True})
 
     def do_OPTIONS(self):
         self.send_response(204)
